@@ -2,7 +2,7 @@ import sys
 
 from model.trainer import Trainer
 
-sys.path.insert(0, '.')
+sys.path.insert(0, ".")
 
 import torch
 import torch.nn.functional as F
@@ -10,8 +10,8 @@ import torch.backends.cudnn as cudnn
 from torch.nn.parallel import gather
 import torch.optim.lr_scheduler
 
-import dataset.dataset as myDataLoader
-import dataset.Transforms as myTransforms
+from dataset.datamodules_change import BinaryChangeDetectionDataModule
+
 from model.metric_tool import ConfuseMatrixMeter
 from model.utils import BCEDiceLoss, init_seed, adjust_learning_rate
 
@@ -19,299 +19,741 @@ import os, time
 import numpy as np
 from argparse import ArgumentParser
 
+# Import wandb
+import wandb
 
 
 @torch.no_grad()
 def val(args, val_loader, model):
     model.eval()
 
-    salEvalVal = ConfuseMatrixMeter(n_class=2)
+    salEvalVal = ConfuseMatrixMeter(n_class=args.num_classes)
 
     epoch_loss = []
 
     total_batches = len(val_loader)
-    print(len(val_loader))
-    for iter, batched_inputs in enumerate(val_loader):
+    print(f"Validation loader length: {len(val_loader)}")
+    for iter, batch in enumerate(val_loader):
 
-        img, target = batched_inputs
-        pre_img = img[:, 0:3]
-        post_img = img[:, 3:6]
+        image1 = batch["image1"]
+        image2 = batch["image2"]
+        target = batch["mask"]
 
         start_time = time.time()
 
         if args.onGPU == True:
-            pre_img = pre_img.cuda()
+            image1 = image1.cuda()
+            image2 = image2.cuda()
             target = target.cuda()
-            post_img = post_img.cuda()
 
-        pre_img_var = torch.autograd.Variable(pre_img).float()
-        post_img_var = torch.autograd.Variable(post_img).float()
-        target_var = torch.autograd.Variable(target).float()
+        output = model(image1, image2)
 
-        # run the mdoel
-        output = model(pre_img_var, post_img_var)
-        loss = BCEDiceLoss(output, target_var)
+        loss = BCEDiceLoss(output, target.float().unsqueeze(1))
 
-        pred = torch.where(output > 0.5, torch.ones_like(output), torch.zeros_like(output)).long()
+        pred = torch.where(
+            output > 0.5, torch.ones_like(output), torch.zeros_like(output)
+        ).long()
 
-        # torch.cuda.synchronize()
         time_taken = time.time() - start_time
 
-        epoch_loss.append(loss.data.item())
+        epoch_loss.append(loss.item())
 
-        # compute the confusion matrix
         if args.onGPU and torch.cuda.device_count() > 1:
-            output = gather(pred, 0, dim=0)
-        # salEvalVal.addBatch(pred, target_var)
-        f1 = salEvalVal.update_cm(pr=pred.cpu().numpy(), gt=target_var.cpu().numpy())
-        if iter % 5 == 0:
-            print('\r[%d/%d] F1: %3f loss: %.3f time: %.3f' % (iter, total_batches, f1, loss.data.item(), time_taken),
-                  end='')
+            pass
 
-    average_epoch_loss_val = sum(epoch_loss) / len(epoch_loss)
+        f1 = salEvalVal.update_cm(pr=pred.cpu().numpy(), gt=target.cpu().numpy())
+        if iter % 5 == 0 and total_batches > 0:
+            print(
+                f"\rValidation: [{iter}/{total_batches}] F1: {f1:.3f} loss: {loss.item():.3f} time: {time_taken:.3f}s",
+                end="",
+            )
+
+    average_epoch_loss_val = sum(epoch_loss) / len(epoch_loss) if epoch_loss else 0
     scores = salEvalVal.get_scores()
+    if total_batches > 0:
+        print()
 
     return average_epoch_loss_val, scores
 
 
-def train(args, train_loader, model, optimizer, epoch, max_batches, cur_iter=0, lr_factor=1.):
-    # switch to train mode
+def train(
+    args,
+    train_loader,
+    model,
+    optimizer,
+    epoch,
+    max_batches_epoch,
+    global_step_offset,
+    total_max_steps,
+    lr_factor=1.0,
+):
     model.train()
 
-    salEvalVal = ConfuseMatrixMeter(n_class=2)
-    epoch_loss = []
+    salEvalVal = ConfuseMatrixMeter(n_class=args.num_classes)
+    epoch_loss_list = []
 
-    for iter, batched_inputs in enumerate(train_loader):
+    for iter_in_epoch, batch in enumerate(train_loader):
+        current_global_step = global_step_offset + iter_in_epoch
+        if current_global_step >= total_max_steps:
+            break
 
-        img, target = batched_inputs
-        pre_img = img[:, 0:3]
-        post_img = img[:, 3:6]
+        image1 = batch["image1"]
+        image2 = batch["image2"]
+        target = batch["mask"]
 
         start_time = time.time()
 
-        # adjust the learning rate
-        lr = adjust_learning_rate(args, optimizer, epoch, iter + cur_iter, max_batches, lr_factor=lr_factor)
+        lr = adjust_learning_rate(
+            args,
+            optimizer,
+            epoch,
+            current_global_step,
+            total_max_steps,
+            lr_factor=lr_factor,
+        )
 
         if args.onGPU == True:
-            pre_img = pre_img.cuda()
+            image1 = image1.cuda()
+            image2 = image2.cuda()
             target = target.cuda()
-            post_img = post_img.cuda()
 
-        pre_img_var = torch.autograd.Variable(pre_img).float()
-        post_img_var = torch.autograd.Variable(post_img).float()
-        target_var = torch.autograd.Variable(target).float()
+        output = model(image1, image2)
+        loss = BCEDiceLoss(output, target.float().unsqueeze(1))
 
-        # run the model
-        output = model(pre_img_var, post_img_var)
-        loss = BCEDiceLoss(output, target_var)
-
-        pred = torch.where(output > 0.5, torch.ones_like(output), torch.zeros_like(output)).long()
+        pred = torch.where(
+            output > 0.5, torch.ones_like(output), torch.zeros_like(output)
+        ).long()
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        epoch_loss.append(loss.data.item())
+        epoch_loss_list.append(loss.item())
         time_taken = time.time() - start_time
-        res_time = (max_batches * args.max_epochs - iter - cur_iter) * time_taken / 3600
+
+        remaining_steps = total_max_steps - current_global_step
+        res_time_hours = (remaining_steps * time_taken) / 3600 if time_taken > 0 else 0
 
         if args.onGPU and torch.cuda.device_count() > 1:
-            output = gather(pred, 0, dim=0)
+            pass
 
-        # Computing F-measure and IoU on GPU
         with torch.no_grad():
-            f1 = salEvalVal.update_cm(pr=pred.cpu().numpy(), gt=target_var.cpu().numpy())
+            f1 = salEvalVal.update_cm(pr=pred.cpu().numpy(), gt=target.cpu().numpy())
 
-        if iter % 5 == 0:
-            print('\riteration: [%d/%d] f1: %.3f lr: %.7f loss: %.3f time:%.3f h' % (
-                iter + cur_iter, max_batches * args.max_epochs, f1, lr, loss.data.item(),
-                res_time),
-                  end='')
+        if iter_in_epoch % args.print_interval == 0:
+            print(
+                f"\rEpoch: {epoch} Iter: [{current_global_step}/{total_max_steps}] F1: {f1:.3f} LR: {lr:.7f} Loss: {loss.item():.3f} ETA: {res_time_hours:.2f}h",
+                end="",
+            )
 
-    average_epoch_loss_train = sum(epoch_loss) / len(epoch_loss)
+        if args.use_wandb and (current_global_step % args.wandb_log_interval == 0):
+            wandb.log(
+                {
+                    "train/loss_step": loss.item(),
+                    "train/lr_step": lr,
+                    "train/f1_step": f1,
+                    "global_step": current_global_step,
+                    "epoch": epoch,
+                }
+            )
+
+    average_epoch_loss_train = (
+        sum(epoch_loss_list) / len(epoch_loss_list) if epoch_loss_list else 0
+    )
     scores = salEvalVal.get_scores()
+    print()
 
-    return average_epoch_loss_train, scores, lr
+    return average_epoch_loss_train, scores, lr, current_global_step + 1
 
 
 def trainValidateSegmentation(args):
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
-    
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
     torch.backends.cudnn.benchmark = True
-
     init_seed(args.seed)
 
-    args.savedir = args.savedir + '_' + args.file_root + '_iter_' + str(args.max_steps) + '_lr_' + str(args.lr) + '/'
+    if args.use_wandb:
+        if args.wandb_api_key:
+            os.environ["WANDB_API_KEY"] = args.wandb_api_key
+            print("Attempting to log in to W&B with provided API key.")
+            try:
+                wandb.login(key=args.wandb_api_key)
+            except Exception as e:
+                print(
+                    f"Failed to login to W&B with provided key: {e}. Ensure WANDB_API_KEY is set or use 'wandb login'."
+                )
 
-    if args.file_root == 'LEVIR':
-         args.file_root = './levir_cd_256'
-    elif args.file_root == 'WHU':
-        args.file_root = './whu_cd_256'
-    elif args.file_root == 'CLCD':
-        args.file_root = './clcd_256'
-    elif args.file_root == 'OSCD':
-        args.file_root = 'oscd_256'
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name if args.wandb_run_name else None,
+            config=vars(args),
+            resume="allow",
+            id=args.wandb_run_id if args.wandb_run_id else None,
+        )
+        if wandb_run:
+            print(f"W&B Run Initialized: {wandb_run.name} (ID: {wandb_run.id})")
+            wandb.save(os.path.abspath(__file__))
+        else:
+            print("W&B initialization failed. Continuing without W&B logging.")
+            args.use_wandb = False
+
+    run_name_suffix = f"{args.model_type}_steps_{args.max_steps}_lr_{args.lr}_bs_{args.batch_size}_seed_{args.seed}"
+    if args.wandb_run_name:
+        run_name = args.wandb_run_name
+    elif args.use_wandb and wandb_run:
+        run_name = wandb_run.name
     else:
-        raise TypeError('%s has not defined' % args.file_root)
+        run_name = run_name_suffix
+
+    args.savedir = os.path.join(args.experiment_dir, run_name)
 
     if not os.path.exists(args.savedir):
         os.makedirs(args.savedir)
-
+        print(f"Created save directory: {args.savedir}")
 
     model = Trainer(args.model_type).float()
     if args.onGPU:
         model = model.cuda()
 
-    # mean = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-    # std = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+    if args.use_wandb and wandb_run:
+        wandb.watch(model, log="all", log_freq=args.wandb_watch_interval)
 
-    mean = [0.406, 0.456, 0.485, 0.406, 0.456, 0.485]
-    std = [0.225, 0.224, 0.229, 0.225, 0.224, 0.229]
+    if args.num_classes > 2:
+        from dataset.datamodules_change import MultiClassChangeDetectionDataModule
 
-    # compose the data with transforms
-    trainDataset_main = myTransforms.Compose([
-        myTransforms.Normalize(mean=mean, std=std),
-        myTransforms.Scale(args.inWidth, args.inHeight),
-        myTransforms.RandomCropResize(int(7. / 224. * args.inWidth)),
-        myTransforms.RandomFlip(),
-        myTransforms.RandomExchange(),
-        myTransforms.ToTensor()
-    ])
+        datamodule_class = MultiClassChangeDetectionDataModule
+        print(
+            f"Using MultiClassChangeDetectionDataModule with {args.num_classes} classes."
+        )
+    else:
+        datamodule_class = BinaryChangeDetectionDataModule
+        args.num_classes = 2
+        print("Using BinaryChangeDetectionDataModule.")
 
-    valDataset = myTransforms.Compose([
-        myTransforms.Normalize(mean=mean, std=std),
-        myTransforms.Scale(args.inWidth, args.inHeight),
-        myTransforms.ToTensor()
-    ])
-
-    train_data = myDataLoader.Dataset(file_root=args.file_root, mode="train", transform=trainDataset_main)
-
-    trainLoader = torch.utils.data.DataLoader(
-        train_data,
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=False
+    datamodule = datamodule_class(
+        image1_path=args.image1_path,
+        image2_path=args.image2_path,
+        mask_path=args.mask_path,
+        train_roi_path=args.train_roi_path,
+        val_roi_path=args.val_roi_path,
+        test_roi_path=args.test_roi_path,
+        label_poly_path=args.label_poly_path,
+        num_classes=args.num_classes,
+        patch_size=(args.inHeight, args.inWidth),
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        samples_per_epoch=args.samples_per_epoch,
     )
 
-    test_data = myDataLoader.Dataset(file_root=args.file_root, mode="test", transform=valDataset)
-    testLoader = torch.utils.data.DataLoader(
-        test_data, shuffle=False,
-        batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
+    datamodule.setup("fit")
+    trainLoader = datamodule.train_dataloader()
+    try:
+        valLoader = datamodule.val_dataloader()
+        if len(valLoader) == 0 and args.val_roi_path:
+            print(
+                "Val Dataloader is empty despite val_roi_path being set. Check val_roi. Falling back to Test Dataloader."
+            )
+            datamodule.setup("test")
+            valLoader = datamodule.test_dataloader()
+        elif not args.val_roi_path:
+            print("val_roi_path not provided. Using Test Dataloader for validation.")
+            datamodule.setup("test")
+            valLoader = datamodule.test_dataloader()
 
+    except (NotImplementedError, RuntimeError):
+        print(
+            "Failed to get val_dataloader, falling back to Test Dataloader for validation."
+        )
+        datamodule.setup("test")
+        valLoader = datamodule.test_dataloader()
 
-    max_batches = len(trainLoader)
-    print('For each epoch, we have {} batches'.format(max_batches))
+    max_batches_epoch = len(trainLoader)
+    if max_batches_epoch == 0:
+        print(
+            "ERROR: Training loader has 0 batches. Check data paths, ROIs, and sampler logic."
+        )
+        if args.use_wandb and wandb_run:
+            wandb.finish(exit_code=1)
+        return
+
+    print(f"Train loader: {max_batches_epoch} batches per epoch.")
+    print(f"Validation loader: {len(valLoader)} batches.")
 
     if args.onGPU:
         cudnn.benchmark = True
 
-    args.max_epochs = int(np.ceil(args.max_steps / max_batches))
+    args.max_epochs = (
+        int(np.ceil(args.max_steps / max_batches_epoch)) if max_batches_epoch > 0 else 1
+    )
     start_epoch = 0
-    cur_iter = 0
+    current_global_step = 0
     max_F1_val = 0
 
-    if args.resume is not None:
-        args.resume = args.savedir + 'checkpoint.pth.tar'
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
-            start_epoch = checkpoint['epoch']
-            cur_iter = start_epoch * len(trainLoader)
-            # args.lr = checkpoint['lr']
-            model.load_state_dict(checkpoint['state_dict'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+    if args.use_wandb and wandb_run and wandb_run.resumed:
+        print(f"W&B Run '{wandb_run.name}' (ID: {wandb_run.id}) is resuming.")
 
-    logFileLoc = args.savedir + args.logFile
-    if os.path.isfile(logFileLoc):
-        logger = open(logFileLoc, 'a')
-    else:
-        logger = open(logFileLoc, 'w')
+    if args.resume is not None:
+        resume_path = args.resume
+        if not os.path.isabs(resume_path) and not os.path.exists(resume_path):
+            resume_path = os.path.join(args.savedir, "checkpoint.pth.tar")
+
+        if os.path.isfile(resume_path):
+            print(f"=> loading checkpoint '{resume_path}'")
+            checkpoint = torch.load(
+                resume_path, map_location="cuda" if args.onGPU else "cpu"
+            )
+            start_epoch = checkpoint.get("epoch", start_epoch)
+            current_global_step = checkpoint.get(
+                "current_global_step", start_epoch * max_batches_epoch
+            )
+            model.load_state_dict(checkpoint["state_dict"])
+            max_F1_val = checkpoint.get("F_val", max_F1_val)
+            if "optimizer" in checkpoint and args.resume_optimizer:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                print("Optimizer state loaded from checkpoint.")
+
+            print(
+                f"=> loaded checkpoint '{resume_path}' (epoch {start_epoch}, global_step {current_global_step})"
+            )
+        else:
+            print(f"=> no checkpoint found at '{resume_path}'")
+
+    logFileLoc = os.path.join(args.savedir, args.logFile)
+    log_mode = (
+        "a"
+        if os.path.isfile(logFileLoc)
+        and (args.resume or (args.use_wandb and wandb_run and wandb_run.resumed))
+        else "w"
+    )
+    logger = open(logFileLoc, log_mode)
+    if log_mode == "w":
         logger.write(
-            "\n%s\t%s\t%s\t%s\t%s\t%s\t%s" % ('Epoch', 'Kappa (val)', 'IoU (val)', 'F1 (val)', 'R (val)', 'P (val)', 'OA (val)'))
+            "\n%s\t%s\t%s\t%s\t%s\t%s\t%s"
+            % (
+                "Epoch",
+                "Kappa (val)",
+                "IoU (val)",
+                "F1 (val)",
+                "R (val)",
+                "P (val)",
+                "OA (val)",
+            )
+        )
     logger.flush()
 
-    optimizer = torch.optim.Adam(model.parameters(), args.lr, (0.9, 0.99), eps=1e-08, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        args.lr,
+        betas=(0.9, 0.99),
+        eps=1e-08,
+        weight_decay=args.weight_decay,
+    )
+    if (
+        args.resume
+        and os.path.isfile(resume_path)
+        and "optimizer" in checkpoint
+        and args.resume_optimizer
+    ):
+        optimizer.load_state_dict(checkpoint["optimizer"])
 
     for epoch in range(start_epoch, args.max_epochs):
-        lossTr, score_tr, lr = \
-            train(args, trainLoader, model, optimizer, epoch, max_batches, cur_iter)
-        cur_iter += len(trainLoader)
+        if current_global_step >= args.max_steps:
+            print(
+                f"Reached max_steps {args.max_steps} at epoch {epoch}. Stopping training."
+            )
+            break
+
+        lossTr, score_tr, lr, next_global_step_offset = train(
+            args,
+            trainLoader,
+            model,
+            optimizer,
+            epoch,
+            max_batches_epoch,
+            current_global_step,
+            args.max_steps,
+        )
+
+        if args.use_wandb and wandb_run:
+            wandb.log(
+                {
+                    "train/epoch_loss": lossTr,
+                    "train/epoch_F1": score_tr["F1"],
+                    "train/epoch_Kappa": score_tr["Kappa"],
+                    "train/epoch_IoU": score_tr["IoU"],
+                    "train/epoch_OA": score_tr["OA"],
+                    "train/epoch_precision": score_tr["precision"],
+                    "train/epoch_recall": score_tr["recall"],
+                    "epoch": epoch,
+                    "global_step": current_global_step,
+                }
+            )
+        current_global_step = next_global_step_offset
 
         torch.cuda.empty_cache()
 
-        # evaluate on validation set
-        if epoch == 0:
-            continue
+        perform_validation = False
+        if len(valLoader) > 0:
+            if (
+                epoch == start_epoch
+                and args.resume is None
+                and not args.validate_first_epoch
+            ):
+                print(
+                    f"Skipping validation for initial epoch {epoch} as per validate_first_epoch=False."
+                )
+            elif (epoch + 1) % args.val_interval == 0:
+                perform_validation = True
 
-        lossVal, score_val = val(args, testLoader, model)
-        torch.cuda.empty_cache()
-        logger.write("\n%d\t\t%.4f\t\t%.4f\t\t%.4f\t\t%.4f\t\t%.4f\t\t%.4f" % (epoch, score_val['Kappa'], score_val['IoU'],
-                                                                       score_val['F1'], score_val['recall'],
-                                                                       score_val['precision'], score_val['OA']))
-        logger.flush()
+        if perform_validation:
+            lossVal, score_val = val(args, valLoader, model)
+            torch.cuda.empty_cache()
+            print(
+                f"\nEpoch {epoch}: Train Loss={lossTr:.4f}, Val Loss={lossVal:.4f}, F1(tr)={score_tr['F1']:.4f}, F1(val)={score_val['F1']:.4f}"
+            )
+            logger.write(
+                f"\n{epoch}\t\t{score_val['Kappa']:.4f}\t\t{score_val['IoU']:.4f}\t\t{score_val['F1']:.4f}\t\t{score_val['recall']:.4f}\t\t{score_val['precision']:.4f}\t\t{score_val['OA']:.4f}"
+            )
+            logger.flush()
 
-        torch.save({
-            'epoch': epoch + 1,
-            'arch': str(model),
-            'state_dict': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'lossTr': lossTr,
-            'lossVal': lossVal,
-            'F_Tr': score_tr['F1'],
-            'F_val': score_val['F1'],
-            'lr': lr
-        }, args.savedir + 'checkpoint.pth.tar')
+            if args.use_wandb and wandb_run:
+                wandb.log(
+                    {
+                        "val/loss": lossVal,
+                        "val/F1": score_val["F1"],
+                        "val/Kappa": score_val["Kappa"],
+                        "val/IoU": score_val["IoU"],
+                        "val/OA": score_val["OA"],
+                        "val/precision": score_val["precision"],
+                        "val/recall": score_val["recall"],
+                        "epoch": epoch,
+                        "global_step": current_global_step,
+                    }
+                )
 
-        # save the model also
-        model_file_name = args.savedir + 'best_model.pth'
-        if epoch % 1 == 0 and max_F1_val <= score_val['F1']:
-            max_F1_val = score_val['F1']
-            torch.save(model.state_dict(), model_file_name)
+            is_best = score_val["F1"] > max_F1_val
+            if is_best:
+                max_F1_val = score_val["F1"]
+                best_model_file_name = os.path.join(args.savedir, "best_model.pth")
+                torch.save(model.state_dict(), best_model_file_name)
+                print(
+                    f"Saved new best model with F1: {max_F1_val:.4f} to {best_model_file_name}"
+                )
+                if args.use_wandb and wandb_run:
+                    wandb.save(best_model_file_name)
+                    wandb.summary["best_F1_val"] = max_F1_val
+                    wandb.summary["best_val_epoch"] = epoch
 
-        print("Epoch " + str(epoch) + ': Details')
-        print("\nEpoch No. %d:\tTrain Loss = %.4f\tVal Loss = %.4f\t F1(tr) = %.4f\t F1(val) = %.4f" \
-              % (epoch, lossTr, lossVal, score_tr['F1'], score_val['F1']))
-        torch.cuda.empty_cache()
+        else:
+            lossVal = -1
+            if (
+                epoch == start_epoch
+                and args.resume is None
+                and not args.validate_first_epoch
+            ):
+                pass
+            elif len(valLoader) == 0:
+                if epoch == start_epoch:
+                    print("(No validation loader configured)")
+            else:
+                if epoch % args.print_interval == 0:
+                    print(
+                        f"(Validation skipped this epoch, interval: {args.val_interval})"
+                    )
 
-    state_dict = torch.load(model_file_name)
-    model.load_state_dict(state_dict)
+            print(
+                f"\nEpoch {epoch}: Train Loss={lossTr:.4f}, F1(tr)={score_tr['F1']:.4f}"
+            )
+            logger.write(f"\n{epoch}\t\tN/A\t\tN/A\t\tN/A\t\tN/A\t\tN/A\t\tN/A")
+            logger.flush()
+            is_best = False
 
-    loss_test, score_test = val(args, testLoader, model)
-    print("\nTest :\t Kappa (te) = %.4f\t IoU (te) = %.4f\t F1 (te) = %.4f\t R (te) = %.4f\t P (te) = %.4f" \
-          % (score_test['Kappa'], score_test['IoU'], score_test['F1'], score_test['recall'], score_test['precision']))
-    logger.write("\n%s\t\t%.4f\t\t%.4f\t\t%.4f\t\t%.4f\t\t%.4f" % ('Test', score_test['Kappa'], score_test['IoU'],
-                                                                   score_test['F1'], score_test['recall'],
-                                                                   score_test['precision'], score_test['OA']))
+        if (epoch + 1) % args.save_interval == 0 or (
+            current_global_step >= args.max_steps
+        ):
+            checkpoint_path = os.path.join(args.savedir, "checkpoint.pth.tar")
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "current_global_step": current_global_step,
+                    "arch": args.model_type,
+                    "state_dict": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "lossTr": lossTr,
+                    "lossVal": (
+                        lossVal if perform_validation and len(valLoader) > 0 else -1
+                    ),
+                    "F_Tr": score_tr["F1"],
+                    "F_val": (
+                        score_val["F1"]
+                        if perform_validation
+                        and len(valLoader) > 0
+                        and "F1" in score_val
+                        else -1
+                    ),
+                    "max_F1_val": max_F1_val,
+                    "lr": lr,
+                    "args": vars(args),
+                },
+                checkpoint_path,
+            )
+            print(f"Saved checkpoint to {checkpoint_path}")
+            if args.use_wandb and wandb_run and args.wandb_save_checkpoints:
+                wandb.save(checkpoint_path)
+
+    print("\nTraining finished. Evaluating on test set...")
+    datamodule.setup("test")
+    testLoader = datamodule.test_dataloader()
+    final_test_metrics = {}
+    if len(testLoader) > 0:
+        best_model_path = os.path.join(args.savedir, "best_model.pth")
+        if os.path.exists(best_model_path):
+            print(f"Loading best model for final test: {best_model_path}")
+            state_dict = torch.load(
+                best_model_path, map_location="cuda" if args.onGPU else "cpu"
+            )
+            model.load_state_dict(state_dict)
+        else:
+            print("Best model not found, using last model for testing.")
+
+        loss_test, score_test = val(args, testLoader, model)
+        print(
+            f"\nTest Results: Kappa={score_test['Kappa']:.4f}, IoU={score_test['IoU']:.4f}, F1={score_test['F1']:.4f}, Recall={score_test['recall']:.4f}, Precision={score_test['precision']:.4f}, OA={score_test['OA']:.4f}"
+        )
+        logger.write(
+            f"\nTest\t\t{score_test['Kappa']:.4f}\t\t{score_test['IoU']:.4f}\t\t{score_test['F1']:.4f}\t\t{score_test['recall']:.4f}\t\t{score_test['precision']:.4f}\t\t{score_test['OA']:.4f}"
+        )
+        final_test_metrics = {
+            "test/loss": loss_test,
+            "test/F1": score_test["F1"],
+            "test/Kappa": score_test["Kappa"],
+            "test/IoU": score_test["IoU"],
+            "test/OA": score_test["OA"],
+            "test/precision": score_test["precision"],
+            "test/recall": score_test["recall"],
+        }
+    else:
+        print("No test data loader configured. Skipping final test evaluation.")
+        logger.write("\nTest\t\tN/A\t\tN/A\t\tN/A\t\tN/A\t\tN/A\t\tN/A")
+
     logger.flush()
     logger.close()
+    print(f"Log file saved to: {logFileLoc}")
+
+    if args.use_wandb and wandb_run:
+        if final_test_metrics:
+            wandb.log(final_test_metrics)
+        wandb.finish()
+    print("Training si done, shutting down...")
+    os.system("shutdown now")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument('--file_root', default="LEVIR", help='Data directory | LEVIR | WHU | CLCD | OSCD ')
-    parser.add_argument('--inWidth', type=int, default=256, help='Width of RGB image')
-    parser.add_argument('--inHeight', type=int, default=256, help='Height of RGB image')
-    parser.add_argument('--max_steps', type=int, default=80000, help='Max. number of iterations')
-    parser.add_argument('--num_workers', type=int, default=4, help='No. of parallel threads')
-    parser.add_argument('--model_type', type=str, default='small', help='select vit model type | tiny | small')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
-    parser.add_argument('--step_loss', type=int, default=100, help='Decrease learning rate after how many epochs')
-    parser.add_argument('--lr', type=float, default=2e-4, help='Initial learning rate')
-    parser.add_argument('--lr_mode', default='poly', help='Learning rate policy, step or poly')
-    parser.add_argument('--seed', default=16, help='initialization seed number')
-    parser.add_argument('--savedir', default='./results', help='Directory to save the results')
-    parser.add_argument('--resume', default=None, help='Use this checkpoint to continue training | '
-                                                       './results_ep100/checkpoint.pth.tar')
-    parser.add_argument('--logFile', default='trainValLog.txt',
-                        help='File that stores the training and validation logs')
-    parser.add_argument('--onGPU', default=True, type=lambda x: (str(x).lower() == 'true'),
-                        help='Run on CPU or GPU. If TRUE, then GPU.')
-    parser.add_argument('--gpu_id', default=0, type=int, help='GPU id number')
+
+    parser.add_argument(
+        "--image1_path",
+        type=str,
+        default="/home/hkristen/habitalp2/data/processed/orthos_rgb_2003_2013/flug_2003_rgb.tif",
+        help="Path to the first (before) image",
+    )
+    parser.add_argument(
+        "--image2_path",
+        type=str,
+        default="/home/hkristen/habitalp2/data/processed/orthos_rgb_2003_2013/flug_2013_rgb.tif",
+        help="Path to the second (after) image",
+    )
+    parser.add_argument(
+        "--mask_path",
+        type=str,
+        default="/home/hkristen/habitalp2/data/processed/orthos_rgb_2003_2013/habitalp_change_2003_2013_B_C_prio3_rasterized_cog.tif",
+        help="Path to the change mask",
+    )
+    parser.add_argument(
+        "--label_poly_path",
+        type=str,
+        default="/home/hkristen/habitalp2/data/processed/orthos_rgb_2003_2013/habitalp_change_2003_2013_B_C_prio3_transitions_aggregated.gpkg",
+        help="Path to label polygons for sampling",
+    )
+    parser.add_argument(
+        "--train_roi_path",
+        type=str,
+        default="/home/hkristen/habitalp2/data/processed/orthos_rgb_2003_2013/split_train.gpkg",
+        help="Path to training ROI",
+    )
+    parser.add_argument(
+        "--val_roi_path",
+        type=str,
+        default="/home/hkristen/habitalp2/data/processed/orthos_rgb_2003_2013/split_val.gpkg",
+        help="Path to validation ROI. If not provided, test set is used for validation.",
+    )
+    parser.add_argument(
+        "--test_roi_path",
+        type=str,
+        default="/home/hkristen/habitalp2/data/processed/orthos_rgb_2003_2013/split_test.gpkg",
+        help="Path to test ROI",
+    )
+
+    parser.add_argument(
+        "--num_classes",
+        type=int,
+        default=2,
+        help="Number of classes (2 for binary change, >2 for multi-class)",
+    )
+    parser.add_argument(
+        "--inWidth", type=int, default=256, help="Patch width (Size of image patches)"
+    )
+    parser.add_argument(
+        "--inHeight", type=int, default=256, help="Patch height (Size of image patches)"
+    )
+    parser.add_argument(
+        "--samples_per_epoch",
+        type=int,
+        default=25000,
+        help="Number of samples per epoch for datamodule (can be None)",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="No. of parallel threads for dataloading",
+    )
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="small",
+        choices=["tiny", "small"],
+        help="Select vit model type for ChangeViT",
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=80000,
+        help="Max. number of training steps (iterations)",
+    )
+    parser.add_argument("--lr", type=float, default=2e-4, help="Initial learning rate")
+    parser.add_argument(
+        "--lr_mode",
+        default="poly",
+        choices=["step", "poly"],
+        help="Learning rate policy",
+    )
+    parser.add_argument(
+        "--weight_decay", type=float, default=1e-4, help="Optimizer weight decay"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=16, help="Initialization seed number"
+    )
+
+    parser.add_argument(
+        "--experiment_dir",
+        type=str,
+        default="/home/hkristen/habitalp2/src/models/experiments",
+        help="Base directory to save experiment results",
+    )
+    parser.add_argument(
+        "--resume", default=None, type=str, help="Path to checkpoint to resume training"
+    )
+    parser.add_argument(
+        "--logFile",
+        default="trainValLog.txt",
+        help="File that stores the training and validation logs",
+    )
+    parser.add_argument(
+        "--save_interval", type=int, default=1, help="Save checkpoint every N epochs"
+    )
+
+    parser.add_argument(
+        "--onGPU",
+        default=True,
+        type=lambda x: (str(x).lower() == "true"),
+        help="Run on CPU or GPU",
+    )
+    parser.add_argument(
+        "--gpu_id", default=0, type=int, help="GPU id number if onGPU is true"
+    )
+
+    parser.add_argument(
+        "--use_wandb", action="store_true", help="Enable Weights & Biases logging"
+    )
+    parser.add_argument(
+        "--wandb_project", type=str, default="change-vit", help="W&B project name"
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="W&B entity (username or team name)",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default="TEST_DEV",
+        help="W&B run name (experiment name)",
+    )
+    parser.add_argument(
+        "--wandb_api_key",
+        type=str,
+        default="0f05335491f6648e2beb8972f303e87b9bcab99b",
+        help="W&B API key (prefer using env var WANDB_API_KEY or wandb login)",
+    )
+    parser.add_argument(
+        "--wandb_log_interval",
+        type=int,
+        default=50,
+        help="Log training step metrics to W&B every N global steps",
+    )
+    parser.add_argument(
+        "--wandb_watch_interval",
+        type=int,
+        default=1000,
+        help="Log model gradients/parameters to W&B every N batches (log_freq for wandb.watch)",
+    )
+    parser.add_argument(
+        "--wandb_save_checkpoints",
+        action="store_true",
+        help="Save model checkpoints as W&B artifacts",
+    )
+    parser.add_argument(
+        "--wandb_run_id",
+        type=str,
+        default=None,
+        help="W&B run ID to resume a specific run.",
+    )
+
+    parser.add_argument(
+        "--print_interval",
+        type=int,
+        default=10,
+        help="Print training status every N iterations",
+    )
+    parser.add_argument(
+        "--val_interval", type=int, default=1, help="Run validation every N epochs"
+    )
+
+    parser.add_argument(
+        "--resume_optimizer",
+        action="store_true",
+        help="Resume optimizer state from checkpoint if available",
+    )
+    parser.add_argument(
+        "--validate_first_epoch",
+        action="store_true",
+        help="Run validation after the very first epoch, even if not resuming.",
+    )
 
     args = parser.parse_args()
-    print('Called with args:')
-    print(args)
+
+    if args.samples_per_epoch is not None and args.samples_per_epoch <= 0:
+        args.samples_per_epoch = None
+
+    if args.wandb_run_name == "TEST_DEV" and args.use_wandb:
+        pass
+
+    print("Called with args:")
+    for k, v in sorted(vars(args).items()):
+        print(f"  {k}: {v}")
 
     trainValidateSegmentation(args)

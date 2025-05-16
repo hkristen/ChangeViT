@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Wandb Logs
+wandb/*
+
+# Checkpoints
+checkpoint/*
+
 # C extensions
 *.so
 
