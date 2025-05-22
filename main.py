@@ -474,6 +474,18 @@ def trainValidateSegmentation(args):
                     }
                 )
 
+                # Log class-based metrics
+                if "class_metrics" in score_val:
+                    for class_id, metrics in score_val["class_metrics"].items():
+                        for metric_name, value in metrics.items():
+                            wandb.log(
+                                {
+                                    f"val/{class_id}/{metric_name}": value,
+                                    "epoch": epoch,
+                                    "global_step": current_global_step,
+                                }
+                            )
+
             is_best = score_val["F1"] > max_F1_val
             if is_best:
                 max_F1_val = score_val["F1"]
@@ -563,6 +575,15 @@ def trainValidateSegmentation(args):
         print(
             f"\nTest Results: Kappa={score_test['Kappa']:.4f}, IoU={score_test['IoU']:.4f}, F1={score_test['F1']:.4f}, Recall={score_test['recall']:.4f}, Precision={score_test['precision']:.4f}, OA={score_test['OA']:.4f}"
         )
+
+        # Print class-based metrics
+        if "class_metrics" in score_test:
+            print("\nPer-class metrics:")
+            for class_id, metrics in score_test["class_metrics"].items():
+                print(f"\n{class_id}:")
+                for metric_name, value in metrics.items():
+                    print(f"  {metric_name}: {value:.4f}")
+
         logger.write(
             f"\nTest\t\t{score_test['Kappa']:.4f}\t\t{score_test['IoU']:.4f}\t\t{score_test['F1']:.4f}\t\t{score_test['recall']:.4f}\t\t{score_test['precision']:.4f}\t\t{score_test['OA']:.4f}"
         )
@@ -575,9 +596,12 @@ def trainValidateSegmentation(args):
             "test/precision": score_test["precision"],
             "test/recall": score_test["recall"],
         }
-    else:
-        print("No test data loader configured. Skipping final test evaluation.")
-        logger.write("\nTest\t\tN/A\t\tN/A\t\tN/A\t\tN/A\t\tN/A\t\tN/A")
+
+        # Add class-based metrics to final test metrics
+        if "class_metrics" in score_test:
+            for class_id, metrics in score_test["class_metrics"].items():
+                for metric_name, value in metrics.items():
+                    final_test_metrics[f"test/{class_id}/{metric_name}"] = value
 
     logger.flush()
     logger.close()
@@ -670,14 +694,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_type",
         type=str,
-        default="tiny",
+        default="small",
         choices=["tiny", "small"],
         help="Select vit model type for ChangeViT",
     )
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=10000,
+        default=20000,
         help="Max. number of training steps (iterations)",
     )
     parser.add_argument(
@@ -693,7 +717,7 @@ if __name__ == "__main__":
         "--weight_decay", type=float, default=0.001, help="Optimizer weight decay"
     )
     parser.add_argument(
-        "--seed", type=int, default=16, help="Initialization seed number"
+        "--seed", type=int, default=15, help="Initialization seed number"
     )
 
     parser.add_argument(

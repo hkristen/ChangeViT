@@ -62,6 +62,9 @@ class ConfuseMatrixMeter(AverageMeter):
 
     def get_scores(self):
         scores_dict = cm2score(self.sum)
+        # Add class-based metrics
+        class_metrics = get_class_metrics(self.sum)
+        scores_dict["class_metrics"] = class_metrics
         return scores_dict
 
 
@@ -105,7 +108,15 @@ def cm2score(confusion_matrix):
     pre = ((tp + fn) * (tp + fp) + (tn + fp) * (tn + fn)) / (tp + fp + tn + fn) ** 2
     # kappa
     kappa = (oa - pre) / (1 - pre)
-    score_dict = {'Kappa': kappa, 'IoU': iou, 'F1': f1, 'OA': oa, 'recall': recall, 'precision': precision, 'Pre': pre}
+    score_dict = {
+        "Kappa": kappa,
+        "IoU": iou,
+        "F1": f1,
+        "OA": oa,
+        "recall": recall,
+        "precision": precision,
+        "Pre": pre,
+    }
     return score_dict
 
 
@@ -121,11 +132,51 @@ def get_confuse_matrix(num_classes, label_gts, label_preds):
         :return: <np.ndarray> values for confusion matrix
         """
         mask = (label_gt >= 0) & (label_gt < num_classes)
-        hist = np.bincount(num_classes * label_gt[mask].astype(int) + label_pred[mask],
-                           minlength=num_classes ** 2).reshape(num_classes, num_classes)
+        hist = np.bincount(
+            num_classes * label_gt[mask].astype(int) + label_pred[mask],
+            minlength=num_classes**2,
+        ).reshape(num_classes, num_classes)
         return hist
 
     confusion_matrix = np.zeros((num_classes, num_classes))
     for lt, lp in zip(label_gts, label_preds):
         confusion_matrix += __fast_hist(lt.flatten(), lp.flatten())
     return confusion_matrix
+
+
+def get_class_metrics(confusion_matrix):
+    """Calculate per-class metrics from confusion matrix.
+
+    Args:
+        confusion_matrix: n_class x n_class confusion matrix
+
+    Returns:
+        Dictionary containing per-class metrics (IoU, F1, Precision, Recall)
+    """
+    n_classes = confusion_matrix.shape[0]
+    class_metrics = {}
+
+    for i in range(n_classes):
+        # True positives for this class
+        tp = confusion_matrix[i, i]
+        # False positives for this class
+        fp = np.sum(confusion_matrix[:, i]) - tp
+        # False negatives for this class
+        fn = np.sum(confusion_matrix[i, :]) - tp
+        # True negatives for this class
+        tn = np.sum(confusion_matrix) - (tp + fp + fn)
+
+        # Calculate metrics
+        precision = tp / (tp + fp + np.finfo(np.float32).eps)
+        recall = tp / (tp + fn + np.finfo(np.float32).eps)
+        f1 = 2 * precision * recall / (precision + recall + np.finfo(np.float32).eps)
+        iou = tp / (tp + fp + fn + np.finfo(np.float32).eps)
+
+        class_metrics[f"class_{i}"] = {
+            "IoU": iou,
+            "F1": f1,
+            "Precision": precision,
+            "Recall": recall,
+        }
+
+    return class_metrics
