@@ -587,8 +587,12 @@ def trainValidateSegmentation(args):
         if final_test_metrics:
             wandb.log(final_test_metrics)
         wandb.finish()
-    print("Training si done, shutting down...")
-    os.system("shutdown now")
+    print("Training is done!")
+    if args.auto_shutdown:
+        print("Shutting down system...")
+        os.system("shutdown now")
+    else:
+        print("Training completed. System will not shut down automatically.")
 
 
 if __name__ == "__main__":
@@ -673,7 +677,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=7500,
+        default=10000,
         help="Max. number of training steps (iterations)",
     )
     parser.add_argument(
@@ -752,7 +756,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb_log_interval",
         type=int,
-        default=50,
+        default=10,
         help="Log training step metrics to W&B every N global steps",
     )
     parser.add_argument(
@@ -780,7 +784,7 @@ if __name__ == "__main__":
         help="Print training status every N iterations",
     )
     parser.add_argument(
-        "--val_interval", type=int, default=25, help="Run validation every N steps"
+        "--val_interval", type=int, default=10, help="Run validation every N steps"
     )
 
     parser.add_argument(
@@ -820,6 +824,13 @@ if __name__ == "__main__":
         type=float,
         default=1.44984,
         help="Weight for the change class in loss calculation",
+    )
+
+    # Add shutdown parameter
+    parser.add_argument(
+        "--auto_shutdown",
+        action="store_true",
+        help="Automatically shutdown the system after training completes",
     )
 
     args = parser.parse_args()
