@@ -125,6 +125,8 @@ class BinaryChangeDetectionDataModule(NonGeoDataModule):
             # K.Normalize is removed here, will be applied per image in on_after_batch_transfer
             K.RandomHorizontalFlip(p=0.5),
             K.RandomVerticalFlip(p=0.5),
+            K.RandomBrightness(brightness=(0.5, 1.5), p=0.5),
+            K.RandomRotation(degrees=(-15, 15), p=0.5),
             K.RandomResizedCrop(
                 size=self.patch_size, scale=(0.8, 1.0), ratio=(1, 1), p=1.0
             ),

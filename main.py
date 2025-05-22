@@ -13,7 +13,7 @@ import torch.optim.lr_scheduler
 from dataset.datamodules_change import BinaryChangeDetectionDataModule
 
 from model.metric_tool import ConfuseMatrixMeter
-from model.utils import BCEDiceLoss, init_seed, adjust_learning_rate
+from model.utils import BCEDiceLoss, init_seed, adjust_learning_rate, weight_init
 
 import os, time
 import numpy as np
@@ -48,7 +48,14 @@ def val(args, val_loader, model):
 
         output = model(image1, image2)
 
-        loss = BCEDiceLoss(output, target.float().unsqueeze(1))
+        # Create class weights tensor
+        class_weights = torch.tensor([args.background_weight, args.change_weight])
+        if args.onGPU:
+            class_weights = class_weights.cuda()
+
+        loss = BCEDiceLoss(
+            output, target.float().unsqueeze(1), class_weights=class_weights
+        )
 
         pred = torch.where(
             output > 0.5, torch.ones_like(output), torch.zeros_like(output)
@@ -92,6 +99,11 @@ def train(
     salEvalVal = ConfuseMatrixMeter(n_class=args.num_classes)
     epoch_loss_list = []
 
+    # Create class weights tensor
+    class_weights = torch.tensor([args.background_weight, args.change_weight])
+    if args.onGPU:
+        class_weights = class_weights.cuda()
+
     for iter_in_epoch, batch in enumerate(train_loader):
         current_global_step = global_step_offset + iter_in_epoch
         if current_global_step >= total_max_steps:
@@ -118,7 +130,9 @@ def train(
             target = target.cuda()
 
         output = model(image1, image2)
-        loss = BCEDiceLoss(output, target.float().unsqueeze(1))
+        loss = BCEDiceLoss(
+            output, target.float().unsqueeze(1), class_weights=class_weights
+        )
 
         pred = torch.where(
             output > 0.5, torch.ones_like(output), torch.zeros_like(output)
@@ -171,6 +185,11 @@ def trainValidateSegmentation(args):
     torch.backends.cudnn.benchmark = True
     init_seed(args.seed)
 
+    # Define class weights from arguments
+    class_weights = torch.tensor([args.background_weight, args.change_weight])
+    if args.onGPU:
+        class_weights = class_weights.cuda()
+
     if args.use_wandb:
         if args.wandb_api_key:
             os.environ["WANDB_API_KEY"] = args.wandb_api_key
@@ -214,6 +233,8 @@ def trainValidateSegmentation(args):
     model = Trainer(args.model_type).float()
     if args.onGPU:
         model = model.cuda()
+
+    weight_init(model)
 
     if args.use_wandb and wandb_run:
         wandb.watch(model, log="all", log_freq=args.wandb_watch_interval)
@@ -356,6 +377,11 @@ def trainValidateSegmentation(args):
     ):
         optimizer.load_state_dict(checkpoint["optimizer"])
 
+    # Add early stopping variables
+    best_iou = 0
+    no_improvement_count = 0
+    last_validation_step = 0
+
     for epoch in range(start_epoch, args.max_epochs):
         if current_global_step >= args.max_steps:
             print(
@@ -392,6 +418,7 @@ def trainValidateSegmentation(args):
 
         torch.cuda.empty_cache()
 
+        # Update validation logic to be step-based
         perform_validation = False
         if len(valLoader) > 0:
             if (
@@ -402,12 +429,28 @@ def trainValidateSegmentation(args):
                 print(
                     f"Skipping validation for initial epoch {epoch} as per validate_first_epoch=False."
                 )
-            elif (epoch + 1) % args.val_interval == 0:
+            elif (current_global_step - last_validation_step) >= args.val_interval:
                 perform_validation = True
+                last_validation_step = current_global_step
 
         if perform_validation:
             lossVal, score_val = val(args, valLoader, model)
             torch.cuda.empty_cache()
+
+            # Early stopping check
+            current_iou = score_val["IoU"]
+            if current_iou > best_iou + args.early_stopping_min_delta:
+                best_iou = current_iou
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+
+            if no_improvement_count >= args.early_stopping_patience:
+                print(
+                    f"\nEarly stopping triggered after {current_global_step} steps. No improvement in IoU for {args.early_stopping_patience} validations."
+                )
+                break
+
             print(
                 f"\nEpoch {epoch}: Train Loss={lossTr:.4f}, Val Loss={lossVal:.4f}, F1(tr)={score_tr['F1']:.4f}, F1(val)={score_val['F1']:.4f}"
             )
@@ -623,17 +666,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_type",
         type=str,
-        default="small",
+        default="tiny",
         choices=["tiny", "small"],
         help="Select vit model type for ChangeViT",
     )
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=80000,
+        default=7500,
         help="Max. number of training steps (iterations)",
     )
-    parser.add_argument("--lr", type=float, default=2e-4, help="Initial learning rate")
+    parser.add_argument(
+        "--lr", type=float, default=0.00008, help="Initial learning rate"
+    )
     parser.add_argument(
         "--lr_mode",
         default="poly",
@@ -641,7 +686,7 @@ if __name__ == "__main__":
         help="Learning rate policy",
     )
     parser.add_argument(
-        "--weight_decay", type=float, default=1e-4, help="Optimizer weight decay"
+        "--weight_decay", type=float, default=0.001, help="Optimizer weight decay"
     )
     parser.add_argument(
         "--seed", type=int, default=16, help="Initialization seed number"
@@ -654,7 +699,12 @@ if __name__ == "__main__":
         help="Base directory to save experiment results",
     )
     parser.add_argument(
-        "--resume", default=None, type=str, help="Path to checkpoint to resume training"
+        "--resume",
+        default=None,
+        type=str,
+        help="Path to checkpoint to resume training",
+        # /home/hkristen/ChangeViT/checkpoint/deit_tiny_patch16_224-a1311bcf.pth
+        # /home/hkristen/ChangeViT/checkpoint/dinov2_vits14_pretrain.pth
     )
     parser.add_argument(
         "--logFile",
@@ -662,7 +712,7 @@ if __name__ == "__main__":
         help="File that stores the training and validation logs",
     )
     parser.add_argument(
-        "--save_interval", type=int, default=1, help="Save checkpoint every N epochs"
+        "--save_interval", type=int, default=25, help="Save checkpoint every N epochs"
     )
 
     parser.add_argument(
@@ -708,7 +758,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb_watch_interval",
         type=int,
-        default=1000,
+        default=100,
         help="Log model gradients/parameters to W&B every N batches (log_freq for wandb.watch)",
     )
     parser.add_argument(
@@ -730,7 +780,7 @@ if __name__ == "__main__":
         help="Print training status every N iterations",
     )
     parser.add_argument(
-        "--val_interval", type=int, default=1, help="Run validation every N epochs"
+        "--val_interval", type=int, default=25, help="Run validation every N steps"
     )
 
     parser.add_argument(
@@ -742,6 +792,34 @@ if __name__ == "__main__":
         "--validate_first_epoch",
         action="store_true",
         help="Run validation after the very first epoch, even if not resuming.",
+    )
+
+    # Add early stopping parameters
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=200,
+        help="Number of validation steps to wait before early stopping",
+    )
+    parser.add_argument(
+        "--early_stopping_min_delta",
+        type=float,
+        default=0.001,
+        help="Minimum change in IoU to be considered as improvement",
+    )
+
+    # Add class weights parameters
+    parser.add_argument(
+        "--background_weight",
+        type=float,
+        default=0.55016005,
+        help="Weight for the background class in loss calculation",
+    )
+    parser.add_argument(
+        "--change_weight",
+        type=float,
+        default=1.44984,
+        help="Weight for the change class in loss calculation",
     )
 
     args = parser.parse_args()
