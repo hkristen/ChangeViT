@@ -290,7 +290,29 @@ def predict_large_image_changevit(
                     window=((read_y_start, read_y_end), (read_x_start, read_x_end))
                 )
 
-                # Convert to PyTorch tensors and normalize
+                # Calculate per-image statistics like in training
+                def get_image_stats_uint8_normalized(image_path):
+                    with rasterio.open(image_path) as src:
+                        band_means = []
+                        band_stds = []
+                        for band_idx in range(
+                            1, min(src.count + 1, 4)
+                        ):  # Limit to 3 bands
+                            stats = src.statistics(band_idx, approx=False)
+                            if src.profile["dtype"] == "uint8":
+                                band_means.append(stats.mean / 255.0)
+                                band_stds.append(stats.std / 255.0)
+                            else:
+                                raise ValueError(
+                                    f"Only uint8 images supported. Found {src.profile['dtype']}"
+                                )
+                    return torch.tensor(band_means), torch.tensor(band_stds)
+
+                # Get per-image statistics
+                means1, stds1 = get_image_stats_uint8_normalized(image1_path)
+                means2, stds2 = get_image_stats_uint8_normalized(image2_path)
+
+                # Convert to PyTorch tensors and normalize to [0,1]
                 norm_factor = 255.0 if src1.profile["dtype"] == "uint8" else 65535.0
                 img1_tensor = torch.from_numpy(img1_tile).float() / norm_factor
                 img2_tensor = torch.from_numpy(img2_tile).float() / norm_factor
@@ -305,15 +327,14 @@ def predict_large_image_changevit(
                 if img2_tensor.ndim == 3:
                     img2_tensor = img2_tensor.unsqueeze(0)
 
-                # After dividing by 255, concatenate the two images along channel dim
-                img_cat = torch.cat([img1_tensor, img2_tensor], dim=1)  # (1, 6, H, W)
-                # Normalize with mean=0.5, std=0.5 for all 6 channels
-                mean = torch.tensor([0.5] * 6, device=device).view(1, 6, 1, 1)
-                std = torch.tensor([0.5] * 6, device=device).view(1, 6, 1, 1)
-                img_cat = (img_cat - mean) / std
-                # Then split back if your model expects two images, or pass as is if it expects concatenated input
-                pre_img = img_cat[:, :3, :, :]
-                post_img = img_cat[:, 3:, :, :]
+                # Apply per-image normalization like in training
+                means1_dev = means1.to(device).view(1, 3, 1, 1)
+                stds1_dev = stds1.to(device).view(1, 3, 1, 1)
+                means2_dev = means2.to(device).view(1, 3, 1, 1)
+                stds2_dev = stds2.to(device).view(1, 3, 1, 1)
+
+                pre_img = (img1_tensor - means1_dev) / stds1_dev
+                post_img = (img2_tensor - means2_dev) / stds2_dev
 
                 # Pad if the tile is smaller than tile_size
                 pad_h = tile_size - pre_img.shape[2]

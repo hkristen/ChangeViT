@@ -4,23 +4,19 @@ from model.trainer import Trainer
 
 sys.path.insert(0, ".")
 
-import torch
-import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
-from torch.nn.parallel import gather
-import torch.optim.lr_scheduler
-
-from dataset.datamodules_change import BinaryChangeDetectionDataModule
-
-from model.metric_tool import ConfuseMatrixMeter
-from model.utils import BCEDiceLoss, init_seed, adjust_learning_rate, weight_init
-
-import os, time
-import numpy as np
+import os
+import time
 from argparse import ArgumentParser
 
-# Import wandb
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.optim.lr_scheduler
+
 import wandb
+from dataset.datamodules_change import BinaryChangeDetectionDataModule
+from model.metric_tool import ConfuseMatrixMeter
+from model.utils import BCEDiceLoss, adjust_learning_rate, init_seed, weight_init
 
 
 @torch.no_grad()
